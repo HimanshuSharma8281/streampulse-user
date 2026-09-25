@@ -32,7 +32,6 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<WebRTCViewer | null>(null);
-  const currentStreamRef = useRef<MediaStream | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
@@ -44,29 +43,36 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
   const [hasAudioPermissionIssue, setHasAudioPermissionIssue] = useState(false);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Safe play helper preventing AbortErrors
+  // Safe playback method with autoplay fallback
   const safePlay = async () => {
-    if (!videoRef.current) return;
+    const video = videoRef.current;
+    if (!video) return;
+
     try {
-      await videoRef.current.play();
+      await video.play();
+      console.log('[LivePlayer] Video playback started successfully (unmuted)');
       setConnectionState('connected');
       setHasAudioPermissionIssue(false);
+      setIsPlaying(true);
     } catch (err: any) {
       if (err.name === 'AbortError') {
-        // Ignored: new load algorithm started
+        // Normal interruption due to incoming track attachment
         return;
       }
+
       console.warn('[LivePlayer] Autoplay with sound restricted by browser policy:', err);
-      if (videoRef.current) {
-        videoRef.current.muted = true;
+      if (video) {
+        video.muted = true;
         setIsMuted(true);
         try {
-          await videoRef.current.play();
+          await video.play();
+          console.log('[LivePlayer] Muted fallback playback started');
           setConnectionState('connected');
           setHasAudioPermissionIssue(true);
+          setIsPlaying(true);
         } catch (e: any) {
           if (e.name !== 'AbortError') {
-            console.error('[LivePlayer] Playback error:', e);
+            console.error('[LivePlayer] Muted playback attempt failed:', e);
           }
         }
       }
@@ -79,7 +85,6 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         viewerRef.current.disconnect();
         viewerRef.current = null;
       }
-      currentStreamRef.current = null;
       setConnectionState('offline');
       setDiagnostics(null);
       return;
@@ -89,12 +94,24 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
 
     const viewer = new WebRTCViewer(
       (mediaStream) => {
-        if (videoRef.current) {
-          if (currentStreamRef.current !== mediaStream || videoRef.current.srcObject !== mediaStream) {
-            currentStreamRef.current = mediaStream;
-            videoRef.current.srcObject = mediaStream;
+        const video = videoRef.current;
+        if (!video) return;
+
+        // Idempotently attach remote stream only if different
+        if (video.srcObject !== mediaStream) {
+          console.log('[LivePlayer] Attaching remote MediaStream to video element. Tracks count:', mediaStream.getTracks().length);
+          video.srcObject = mediaStream;
+          video.autoplay = true;
+          video.playsInline = true;
+        }
+
+        if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+          safePlay();
+        } else {
+          video.onloadedmetadata = () => {
+            console.log(`[LivePlayer] onloadedmetadata: resolution=${video.videoWidth}x${video.videoHeight}, readyState=${video.readyState}`);
             safePlay();
-          }
+          };
         }
       },
       (state) => {
@@ -110,9 +127,27 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
 
     return () => {
       viewer.disconnect();
-      currentStreamRef.current = null;
     };
   }, [isLive, streamId]);
+
+  // Periodic video element telemetry logger
+  useEffect(() => {
+    if (!isLive) return;
+
+    const interval = setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      const stream = video.srcObject as MediaStream | null;
+      const vTrack = stream ? stream.getVideoTracks()[0] : null;
+
+      console.log(
+        `[LivePlayer Diagnostic] <video>: readyState=${video.readyState}, size=${video.videoWidth}x${video.videoHeight}, paused=${video.paused}, time=${video.currentTime.toFixed(1)}s | vTrack: readyState=${vTrack?.readyState}, muted=${vTrack?.muted}, enabled=${vTrack?.enabled}`
+      );
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [isLive]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -157,14 +192,20 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
     }
   };
 
-  const handleEnableAudio = () => {
-    if (!videoRef.current) return;
-    videoRef.current.muted = false;
-    videoRef.current.volume = volume > 0 ? volume : 1;
+  const handleEnableAudio = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = false;
+    video.volume = volume > 0 ? volume : 1;
     setVolume(volume > 0 ? volume : 1);
     setIsMuted(false);
     setHasAudioPermissionIssue(false);
-    videoRef.current.play().catch(() => {});
+    try {
+      await video.play();
+      console.log('[LivePlayer] Sound enabled and playing unmuted');
+    } catch (e) {
+      console.warn('[LivePlayer] Error playing unmuted:', e);
+    }
   };
 
   const togglePlay = () => {
@@ -193,17 +234,22 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
     }
   };
 
+  const isFramesReceiving = (diagnostics && (diagnostics.framesDecoded > 0 || diagnostics.framesReceived > 0)) || false;
+
   return (
     <div
       ref={containerRef}
       onMouseMove={handleMouseMove}
       className="relative w-full aspect-video bg-[#000000] rounded-2xl overflow-hidden shadow-2xl border border-white/10 group flex items-center justify-center select-none"
     >
+      {/* Persistent HTML5 Video Element */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
-        className={`w-full h-full object-contain ${!isLive || connectionState === 'offline' ? 'hidden' : 'block'}`}
+        muted={isMuted}
+        className="w-full h-full object-contain"
+        style={{ width: '100%', height: '100%', objectFit: 'contain', backgroundColor: '#000000' }}
       />
 
       {/* Autoplay Audio Permission Prompt */}
@@ -217,7 +263,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         </button>
       )}
 
-      {/* STATE: OFFLINE */}
+      {/* STATE: OFFLINE OVERLAY */}
       {!isLive && (
         <div className="absolute inset-0 bg-gradient-to-b from-[#0e1018] via-[#08090d] to-[#040406] flex flex-col items-center justify-center p-6 text-center z-20">
           <div className="relative mb-6">
@@ -251,9 +297,9 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         </div>
       )}
 
-      {/* STATE: CONNECTING / RECONNECTING */}
-      {isLive && connectionState === 'connecting' && (
-        <div className="absolute inset-0 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center z-20 text-center p-4">
+      {/* STATE: CONNECTING / RECONNECTING (Only shown when not yet receiving frames) */}
+      {isLive && connectionState === 'connecting' && !isFramesReceiving && (
+        <div className="absolute inset-0 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center z-20 text-center p-4">
           <div className="w-12 h-12 rounded-2xl bg-rose-600/20 border border-rose-500/30 flex items-center justify-center mb-3">
             <RefreshCw className="w-6 h-6 text-rose-500 animate-spin" />
           </div>
@@ -288,7 +334,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
 
           <div className="flex items-center gap-2 pointer-events-auto">
             {diagnostics && (
-              <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-[11px] font-mono text-slate-300 flex items-center gap-2">
+              <div className="bg-black/70 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-[11px] font-mono text-slate-300 flex items-center gap-2">
                 <span className="flex items-center gap-1">
                   <Wifi className="w-3 h-3 text-emerald-400" />
                   {diagnostics.bitrateKbps > 0 ? `${(diagnostics.bitrateKbps / 1000).toFixed(1)} Mbps` : 'Live'}
@@ -298,7 +344,13 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
                 {diagnostics.selectedCandidateType && (
                   <>
                     <span className="text-slate-600">|</span>
-                    <span className="text-indigo-400">{diagnostics.selectedCandidateType}</span>
+                    <span className="text-indigo-400 font-semibold">{diagnostics.selectedCandidateType}</span>
+                  </>
+                )}
+                {diagnostics.framesDecoded > 0 && (
+                  <>
+                    <span className="text-slate-600">|</span>
+                    <span className="text-emerald-400">Decoded: {diagnostics.framesDecoded}</span>
                   </>
                 )}
                 <span className="text-slate-600">|</span>

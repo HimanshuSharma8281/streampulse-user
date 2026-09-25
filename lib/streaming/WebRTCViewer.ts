@@ -46,7 +46,12 @@ export interface ViewerDiagnostics {
   packetsLost: number;
   jitter: number;
   rttMs: number;
-  framesDropped: number;
+  framesReceived: number;
+  framesDecoded: number;
+  keyFramesDecoded: number;
+  frameWidth: number;
+  frameHeight: number;
+  codec: string;
   videoTracksCount: number;
   audioTracksCount: number;
   hasAudio: boolean;
@@ -188,12 +193,12 @@ export class WebRTCViewer {
         if (this.peerConnection.remoteDescription && this.peerConnection.remoteDescription.type) {
           try {
             await this.peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-            console.log('[WebRTC] ICE candidate added');
+            console.log('[WebRTC Viewer] ICE candidate added');
           } catch (e) {
-            console.error('[WebRTC] Error adding ICE candidate:', e);
+            console.error('[WebRTC Viewer] Error adding ICE candidate:', e);
           }
         } else {
-          console.log('[WebRTC] ICE candidate queued');
+          console.log('[WebRTC Viewer] ICE candidate queued');
           this.pendingCandidates.push(data.candidate);
         }
       }
@@ -218,17 +223,14 @@ export class WebRTCViewer {
     // Track Reception
     this.peerConnection.ontrack = (event) => {
       const track = event.track;
-      if (track.kind === 'video') {
-        console.log(`[WebRTC Viewer] Remote video track received (${track.label || 'video'})`);
-      } else if (track.kind === 'audio') {
-        console.log(`[WebRTC Viewer] Remote audio track received (${track.label || 'audio'})`);
-      }
+      console.log(`[WebRTC Viewer] Track received: [${track.kind}] (${track.label || 'unnamed'}, id: ${track.id}, readyState: ${track.readyState}, muted: ${track.muted})`);
 
-      // Idempotently add track to remoteStream
+      // 1. Idempotently add track to persistent remoteStream
       if (!this.remoteStream.getTrackById(track.id)) {
         this.remoteStream.addTrack(track);
       }
 
+      // 2. Also ensure stream tracks from event.streams[0] are attached
       if (event.streams && event.streams[0]) {
         event.streams[0].getTracks().forEach((t) => {
           if (!this.remoteStream.getTrackById(t.id)) {
@@ -236,6 +238,18 @@ export class WebRTCViewer {
           }
         });
       }
+
+      // 3. Handle unmuting when frames begin flowing
+      track.onunmute = () => {
+        console.log(`[WebRTC Viewer] Track unmuted and receiving frames: [${track.kind}]`);
+        if (this.onTrackCallback) {
+          this.onTrackCallback(this.remoteStream);
+        }
+      };
+
+      track.onmute = () => {
+        console.log(`[WebRTC Viewer] Track muted: [${track.kind}]`);
+      };
 
       if (this.onTrackCallback) {
         this.onTrackCallback(this.remoteStream);
@@ -248,7 +262,7 @@ export class WebRTCViewer {
         const candidateStr = event.candidate.candidate || '';
         const candType = event.candidate.type || (candidateStr.includes('typ relay') ? 'relay' : candidateStr.includes('typ srflx') ? 'srflx' : 'host');
         const proto = event.candidate.protocol || (candidateStr.includes('udp') ? 'udp' : 'tcp');
-        console.log(`[WebRTC] ICE candidate gathered: type=${candType}, proto=${proto}`);
+        console.log(`[WebRTC Viewer] ICE candidate gathered: type=${candType}, proto=${proto}`);
 
         getSocket().emit('webrtc:ice-candidate', {
           targetSocketId: broadcasterSocketId,
@@ -256,12 +270,12 @@ export class WebRTCViewer {
           attemptId: this.currentAttemptId,
         });
       } else {
-        console.log('[WebRTC] ICE gathering complete');
+        console.log('[WebRTC Viewer] ICE gathering complete');
       }
     };
 
     this.peerConnection.onicegatheringstatechange = () => {
-      console.log(`[WebRTC] ICE gathering state: ${this.peerConnection?.iceGatheringState}`);
+      console.log(`[WebRTC Viewer] ICE gathering state: ${this.peerConnection?.iceGatheringState}`);
     };
 
     // Connection State Change
@@ -299,7 +313,7 @@ export class WebRTCViewer {
     this.peerConnection.oniceconnectionstatechange = () => {
       if (!this.peerConnection) return;
       const iceState = this.peerConnection.iceConnectionState;
-      console.log(`[WebRTC] ICE connection state: ${iceState}`);
+      console.log(`[WebRTC Viewer] ICE connection state: ${iceState}`);
 
       if (iceState === 'connected' || iceState === 'completed') {
         this.clearDisconnectGraceTimer();
@@ -315,9 +329,9 @@ export class WebRTCViewer {
       // Drain queued ICE candidates
       for (const cand of this.pendingCandidates) {
         await this.peerConnection.addIceCandidate(new RTCIceCandidate(cand)).catch((e) =>
-          console.warn('[WebRTC] Error draining ICE candidate:', e)
+          console.warn('[WebRTC Viewer] Error draining ICE candidate:', e)
         );
-        console.log('[WebRTC] ICE candidate added from queue');
+        console.log('[WebRTC Viewer] ICE candidate added from queue');
       }
       this.pendingCandidates = [];
 
@@ -408,7 +422,12 @@ export class WebRTCViewer {
             packetsLost: 0,
             jitter: 0,
             rttMs: 0,
-            framesDropped: 0,
+            framesReceived: 0,
+            framesDecoded: 0,
+            keyFramesDecoded: 0,
+            frameWidth: 0,
+            frameHeight: 0,
+            codec: 'unknown',
             videoTracksCount: videoTracks.length,
             audioTracksCount: audioTracks.length,
             hasAudio: audioTracks.length > 0,
@@ -428,7 +447,12 @@ export class WebRTCViewer {
         let packetsLost = 0;
         let jitter = 0;
         let rttMs = 0;
-        let framesDropped = 0;
+        let framesReceived = 0;
+        let framesDecoded = 0;
+        let keyFramesDecoded = 0;
+        let frameWidth = 0;
+        let frameHeight = 0;
+        let negotiatedCodec = 'video/VP8';
         let selectedCandidateType = 'Direct P2P';
         const now = Date.now();
 
@@ -437,7 +461,11 @@ export class WebRTCViewer {
             if (report.framesPerSecond) fps = Math.round(report.framesPerSecond);
             if (report.packetsLost) packetsLost = report.packetsLost;
             if (report.jitter) jitter = Math.round(report.jitter * 1000);
-            if (report.framesDropped) framesDropped = report.framesDropped;
+            if (report.framesReceived) framesReceived = report.framesReceived;
+            if (report.framesDecoded) framesDecoded = report.framesDecoded;
+            if (report.keyFramesDecoded) keyFramesDecoded = report.keyFramesDecoded;
+            if (report.frameWidth) frameWidth = report.frameWidth;
+            if (report.frameHeight) frameHeight = report.frameHeight;
 
             if (report.bytesReceived) {
               if (this.prevBytesReceived > 0 && this.prevTimestamp > 0) {
@@ -450,6 +478,15 @@ export class WebRTCViewer {
               this.prevBytesReceived = report.bytesReceived;
               this.prevTimestamp = now;
             }
+
+            if (report.codecId) {
+              const codecReport = stats.get(report.codecId);
+              if (codecReport && codecReport.mimeType) {
+                negotiatedCodec = codecReport.mimeType;
+              }
+            }
+
+            console.log(`[WebRTC Diagnostic] Video Inbound: codec=${negotiatedCodec} | rxFrames=${framesReceived} | decFrames=${framesDecoded} | keyFrames=${keyFramesDecoded} | res=${frameWidth}x${frameHeight} @ ${fps}fps | rxBytes=${report.bytesReceived}`);
           }
 
           if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.nominated)) {
@@ -480,7 +517,12 @@ export class WebRTCViewer {
             packetsLost,
             jitter,
             rttMs,
-            framesDropped,
+            framesReceived,
+            framesDecoded,
+            keyFramesDecoded,
+            frameWidth,
+            frameHeight,
+            codec: negotiatedCodec,
             videoTracksCount: videoTracks.length,
             audioTracksCount: audioTracks.length,
             hasAudio: audioTracks.length > 0,
@@ -492,7 +534,7 @@ export class WebRTCViewer {
           });
         }
       } catch (e) {}
-    }, 3000);
+    }, 2000);
   }
 
   public disconnect(): void {
