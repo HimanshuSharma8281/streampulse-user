@@ -17,20 +17,26 @@ function getIceServers(): RTCConfiguration {
   const turnUsername = process.env.NEXT_PUBLIC_TURN_USERNAME;
   const turnCredential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
 
-  if (turnUrl) {
-    const urls = turnUrl.split(',').map((u) => u.trim()).filter(Boolean);
-    if (urls.length > 0) {
-      iceServers.push({
-        urls,
-        ...(turnUsername ? { username: turnUsername } : {}),
-        ...(turnCredential ? { credential: turnCredential } : {}),
-      });
+  if (turnUrl && turnUrl.trim() !== '') {
+    const rawUrls = turnUrl.split(',').map((u) => u.trim()).filter(Boolean);
+    if (rawUrls.length > 0) {
+      const turnEntry: RTCIceServer = {
+        urls: rawUrls,
+      };
+      if (turnUsername && turnUsername.trim() !== '') {
+        turnEntry.username = turnUsername.trim();
+      }
+      if (turnCredential && turnCredential.trim() !== '') {
+        turnEntry.credential = turnCredential.trim();
+      }
+      iceServers.push(turnEntry);
     }
   }
 
   return {
     iceServers,
     iceCandidatePoolSize: 2,
+    iceTransportPolicy: 'all',
   };
 }
 
@@ -47,6 +53,8 @@ export interface ViewerDiagnostics {
   audioLabel?: string;
   connectionState: RTCPeerConnectionState;
   iceState: RTCIceConnectionState;
+  selectedCandidateType?: string;
+  retryAttempt?: number;
 }
 
 export class WebRTCViewer {
@@ -234,15 +242,26 @@ export class WebRTCViewer {
       }
     };
 
-    // ICE Candidate Generation
+    // ICE Candidate Generation & Logging
     this.peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
+        const candidateStr = event.candidate.candidate || '';
+        const candType = event.candidate.type || (candidateStr.includes('typ relay') ? 'relay' : candidateStr.includes('typ srflx') ? 'srflx' : 'host');
+        const proto = event.candidate.protocol || (candidateStr.includes('udp') ? 'udp' : 'tcp');
+        console.log(`[WebRTC] ICE candidate gathered: type=${candType}, proto=${proto}`);
+
         getSocket().emit('webrtc:ice-candidate', {
           targetSocketId: broadcasterSocketId,
           candidate: event.candidate,
           attemptId: this.currentAttemptId,
         });
+      } else {
+        console.log('[WebRTC] ICE gathering complete');
       }
+    };
+
+    this.peerConnection.onicegatheringstatechange = () => {
+      console.log(`[WebRTC] ICE gathering state: ${this.peerConnection?.iceGatheringState}`);
     };
 
     // Connection State Change
@@ -368,6 +387,7 @@ export class WebRTCViewer {
     if (this.peerConnection) {
       this.peerConnection.onconnectionstatechange = null;
       this.peerConnection.oniceconnectionstatechange = null;
+      this.peerConnection.onicegatheringstatechange = null;
       this.peerConnection.onicecandidate = null;
       this.peerConnection.ontrack = null;
       this.peerConnection.close();
@@ -395,6 +415,7 @@ export class WebRTCViewer {
             audioLabel: audioTracks[0]?.label,
             connectionState: this.peerConnection?.connectionState || 'closed',
             iceState: this.peerConnection?.iceConnectionState || 'closed',
+            retryAttempt: this.retryCount,
           });
         }
         return;
@@ -408,6 +429,7 @@ export class WebRTCViewer {
         let jitter = 0;
         let rttMs = 0;
         let framesDropped = 0;
+        let selectedCandidateType = 'Direct P2P';
         const now = Date.now();
 
         stats.forEach((report) => {
@@ -430,9 +452,20 @@ export class WebRTCViewer {
             }
           }
 
-          if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.nominated)) {
             if (report.currentRoundTripTime) {
               rttMs = Math.round(report.currentRoundTripTime * 1000);
+            }
+            const localCand = stats.get(report.localCandidateId);
+            const remoteCand = stats.get(report.remoteCandidateId);
+            const localType = localCand?.candidateType || 'host';
+            const remoteType = remoteCand?.candidateType || 'host';
+            if (localType === 'relay' || remoteType === 'relay') {
+              selectedCandidateType = 'TURN Relay';
+            } else if (localType === 'srflx' || remoteType === 'srflx') {
+              selectedCandidateType = 'STUN srflx';
+            } else {
+              selectedCandidateType = 'Direct P2P';
             }
           }
         });
@@ -454,6 +487,8 @@ export class WebRTCViewer {
             audioLabel: audioTracks[0]?.label,
             connectionState: this.peerConnection.connectionState,
             iceState: this.peerConnection.iceConnectionState,
+            selectedCandidateType,
+            retryAttempt: this.retryCount,
           });
         }
       } catch (e) {}

@@ -32,6 +32,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<WebRTCViewer | null>(null);
+  const currentStreamRef = useRef<MediaStream | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
@@ -43,12 +44,42 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
   const [hasAudioPermissionIssue, setHasAudioPermissionIssue] = useState(false);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Safe play helper preventing AbortErrors
+  const safePlay = async () => {
+    if (!videoRef.current) return;
+    try {
+      await videoRef.current.play();
+      setConnectionState('connected');
+      setHasAudioPermissionIssue(false);
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // Ignored: new load algorithm started
+        return;
+      }
+      console.warn('[LivePlayer] Autoplay with sound restricted by browser policy:', err);
+      if (videoRef.current) {
+        videoRef.current.muted = true;
+        setIsMuted(true);
+        try {
+          await videoRef.current.play();
+          setConnectionState('connected');
+          setHasAudioPermissionIssue(true);
+        } catch (e: any) {
+          if (e.name !== 'AbortError') {
+            console.error('[LivePlayer] Playback error:', e);
+          }
+        }
+      }
+    }
+  };
+
   useEffect(() => {
     if (!isLive) {
       if (viewerRef.current) {
         viewerRef.current.disconnect();
         viewerRef.current = null;
       }
+      currentStreamRef.current = null;
       setConnectionState('offline');
       setDiagnostics(null);
       return;
@@ -59,30 +90,11 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
     const viewer = new WebRTCViewer(
       (mediaStream) => {
         if (videoRef.current) {
-          videoRef.current.srcObject = mediaStream;
-
-          // Attempt playback
-          videoRef.current
-            .play()
-            .then(() => {
-              setConnectionState('connected');
-              setHasAudioPermissionIssue(false);
-            })
-            .catch((err) => {
-              console.warn('[LivePlayer] Autoplay with sound restricted by browser policy:', err);
-              // Fallback to muted autoplay and prompt user to unmute
-              if (videoRef.current) {
-                videoRef.current.muted = true;
-                setIsMuted(true);
-                videoRef.current
-                  .play()
-                  .then(() => {
-                    setConnectionState('connected');
-                    setHasAudioPermissionIssue(true);
-                  })
-                  .catch((e) => console.error('[LivePlayer] Playback error:', e));
-              }
-            });
+          if (currentStreamRef.current !== mediaStream || videoRef.current.srcObject !== mediaStream) {
+            currentStreamRef.current = mediaStream;
+            videoRef.current.srcObject = mediaStream;
+            safePlay();
+          }
         }
       },
       (state) => {
@@ -98,6 +110,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
 
     return () => {
       viewer.disconnect();
+      currentStreamRef.current = null;
     };
   }, [isLive, streamId]);
 
@@ -157,7 +170,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
   const togglePlay = () => {
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
-      videoRef.current.play();
+      videoRef.current.play().catch(() => {});
       setIsPlaying(true);
     } else {
       videoRef.current.pause();
@@ -190,11 +203,11 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         ref={videoRef}
         autoPlay
         playsInline
-        className={`w-full h-full object-contain ${!isLive ? 'hidden' : 'block'}`}
+        className={`w-full h-full object-contain ${!isLive || connectionState === 'offline' ? 'hidden' : 'block'}`}
       />
 
       {/* Autoplay Audio Permission Prompt */}
-      {isLive && hasAudioPermissionIssue && (
+      {isLive && hasAudioPermissionIssue && connectionState === 'connected' && (
         <button
           onClick={handleEnableAudio}
           className="absolute top-16 left-1/2 transform -translate-x-1/2 z-30 px-5 py-2.5 bg-rose-600/95 hover:bg-rose-500 text-white text-xs font-bold rounded-full shadow-2xl backdrop-blur-md flex items-center gap-2.5 transition-all hover:scale-105 active:scale-95 animate-bounce border border-rose-400/40"
@@ -238,13 +251,26 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         </div>
       )}
 
-      {/* STATE: CONNECTING */}
+      {/* STATE: CONNECTING / RECONNECTING */}
       {isLive && connectionState === 'connecting' && (
-        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center z-20 text-center p-4">
+        <div className="absolute inset-0 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center z-20 text-center p-4">
           <div className="w-12 h-12 rounded-2xl bg-rose-600/20 border border-rose-500/30 flex items-center justify-center mb-3">
             <RefreshCw className="w-6 h-6 text-rose-500 animate-spin" />
           </div>
-          <p className="text-sm font-semibold text-white">Connecting to live stream...</p>
+          <p className="text-sm font-semibold text-white mb-1">
+            {diagnostics?.retryAttempt && diagnostics.retryAttempt > 0
+              ? `Reconnecting to live stream (attempt #${diagnostics.retryAttempt})...`
+              : 'Connecting to live stream...'}
+          </p>
+          <p className="text-xs text-slate-400 max-w-xs mb-3">
+            Establishing secure peer connection. Please wait...
+          </p>
+          <button
+            onClick={handleManualReconnect}
+            className="px-3.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs text-slate-200 border border-white/10 transition-colors"
+          >
+            Reconnect Now
+          </button>
         </div>
       )}
 
@@ -269,6 +295,12 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
                 </span>
                 <span className="text-slate-600">|</span>
                 <span>{diagnostics.fps} FPS</span>
+                {diagnostics.selectedCandidateType && (
+                  <>
+                    <span className="text-slate-600">|</span>
+                    <span className="text-indigo-400">{diagnostics.selectedCandidateType}</span>
+                  </>
+                )}
                 <span className="text-slate-600">|</span>
                 <span className={diagnostics.hasAudio ? 'text-emerald-400' : 'text-amber-400'}>
                   {diagnostics.hasAudio ? 'Audio: 1' : 'Audio: 0'}
