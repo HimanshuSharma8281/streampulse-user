@@ -11,8 +11,10 @@ import {
   RefreshCw,
   Tv,
   Wifi,
+  Activity,
+  CheckCircle2,
 } from 'lucide-react';
-import { WebRTCViewer } from '@/lib/streaming/WebRTCViewer';
+import { WebRTCViewer, ViewerDiagnostics } from '@/lib/streaming/WebRTCViewer';
 import { LiveBadge } from '../stream/LiveBadge';
 import { ViewerCount } from '../stream/ViewerCount';
 
@@ -36,6 +38,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [connectionState, setConnectionState] = useState<string>('idle');
+  const [diagnostics, setDiagnostics] = useState<ViewerDiagnostics | null>(null);
   const [showControls, setShowControls] = useState(true);
   const [hasAudioPermissionIssue, setHasAudioPermissionIssue] = useState(false);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -47,6 +50,7 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         viewerRef.current = null;
       }
       setConnectionState('offline');
+      setDiagnostics(null);
       return;
     }
 
@@ -56,6 +60,8 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
       (mediaStream) => {
         if (videoRef.current) {
           videoRef.current.srcObject = mediaStream;
+
+          // Attempt playback
           videoRef.current
             .play()
             .then(() => {
@@ -63,18 +69,27 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
               setHasAudioPermissionIssue(false);
             })
             .catch((err) => {
-              console.warn('[LivePlayer] Autoplay blocked, playing muted:', err);
+              console.warn('[LivePlayer] Autoplay with sound restricted by browser policy:', err);
+              // Fallback to muted autoplay and prompt user to unmute
               if (videoRef.current) {
                 videoRef.current.muted = true;
                 setIsMuted(true);
-                videoRef.current.play();
-                setHasAudioPermissionIssue(true);
+                videoRef.current
+                  .play()
+                  .then(() => {
+                    setConnectionState('connected');
+                    setHasAudioPermissionIssue(true);
+                  })
+                  .catch((e) => console.error('[LivePlayer] Playback error:', e));
               }
             });
         }
       },
       (state) => {
         setConnectionState(state);
+      },
+      (diag) => {
+        setDiagnostics(diag);
       }
     );
 
@@ -110,6 +125,9 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
       videoRef.current.volume = newVol;
       videoRef.current.muted = newVol === 0;
       setIsMuted(newVol === 0);
+      if (hasAudioPermissionIssue && newVol > 0) {
+        setHasAudioPermissionIssue(false);
+      }
     }
   };
 
@@ -118,7 +136,22 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
     const nextMuted = !isMuted;
     videoRef.current.muted = nextMuted;
     setIsMuted(nextMuted);
-    if (hasAudioPermissionIssue) setHasAudioPermissionIssue(false);
+    if (!nextMuted && videoRef.current.paused) {
+      videoRef.current.play().catch(() => {});
+    }
+    if (hasAudioPermissionIssue) {
+      setHasAudioPermissionIssue(false);
+    }
+  };
+
+  const handleEnableAudio = () => {
+    if (!videoRef.current) return;
+    videoRef.current.muted = false;
+    videoRef.current.volume = volume > 0 ? volume : 1;
+    setVolume(volume > 0 ? volume : 1);
+    setIsMuted(false);
+    setHasAudioPermissionIssue(false);
+    videoRef.current.play().catch(() => {});
   };
 
   const togglePlay = () => {
@@ -161,14 +194,14 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         className={`w-full h-full object-contain ${!isLive ? 'hidden' : 'block'}`}
       />
 
-      {/* Unmute prompt if browser blocked autoplay */}
-      {hasAudioPermissionIssue && (
+      {/* Autoplay Audio Permission Prompt */}
+      {isLive && hasAudioPermissionIssue && (
         <button
-          onClick={toggleMute}
-          className="absolute top-4 left-1/2 transform -translate-x-1/2 z-30 px-4 py-2 bg-rose-600/90 hover:bg-rose-500 text-white text-xs font-semibold rounded-full shadow-lg backdrop-blur-sm flex items-center gap-2 animate-bounce"
+          onClick={handleEnableAudio}
+          className="absolute top-16 left-1/2 transform -translate-x-1/2 z-30 px-5 py-2.5 bg-rose-600/95 hover:bg-rose-500 text-white text-xs font-bold rounded-full shadow-2xl backdrop-blur-md flex items-center gap-2.5 transition-all hover:scale-105 active:scale-95 animate-bounce border border-rose-400/40"
         >
-          <VolumeX className="w-4 h-4" />
-          <span>Click to enable audio</span>
+          <Volume2 className="w-4 h-4 text-white" />
+          <span>Click to enable stream sound</span>
         </button>
       )}
 
@@ -228,9 +261,21 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
             <ViewerCount count={viewerCount} isLive={true} size="md" />
           </div>
 
-          <div className="pointer-events-auto bg-black/60 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-xs font-medium text-slate-300 flex items-center gap-1.5">
-            <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-            <span>1080p Ultra HD</span>
+          <div className="flex items-center gap-2 pointer-events-auto">
+            {diagnostics && (
+              <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-[11px] font-mono text-slate-300 flex items-center gap-2">
+                <span className="flex items-center gap-1">
+                  <Wifi className="w-3 h-3 text-emerald-400" />
+                  {diagnostics.bitrateKbps > 0 ? `${(diagnostics.bitrateKbps / 1000).toFixed(1)} Mbps` : 'Live'}
+                </span>
+                <span className="text-slate-600">|</span>
+                <span>{diagnostics.fps} FPS</span>
+                <span className="text-slate-600">|</span>
+                <span className={diagnostics.hasAudio ? 'text-emerald-400' : 'text-amber-400'}>
+                  {diagnostics.hasAudio ? 'Audio: 1' : 'Audio: 0'}
+                </span>
+              </div>
+            )}
           </div>
         </div>
       )}
