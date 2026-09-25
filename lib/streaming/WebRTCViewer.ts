@@ -2,13 +2,37 @@
 
 import { getSocket } from '../socket/socketClient';
 
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
-  iceCandidatePoolSize: 2,
-};
+function getIceServers(): RTCConfiguration {
+  const iceServers: RTCIceServer[] = [
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+      ],
+    },
+  ];
+
+  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
+  const turnUsername = process.env.NEXT_PUBLIC_TURN_USERNAME;
+  const turnCredential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
+
+  if (turnUrl) {
+    const urls = turnUrl.split(',').map((u) => u.trim()).filter(Boolean);
+    if (urls.length > 0) {
+      iceServers.push({
+        urls,
+        ...(turnUsername ? { username: turnUsername } : {}),
+        ...(turnCredential ? { credential: turnCredential } : {}),
+      });
+    }
+  }
+
+  return {
+    iceServers,
+    iceCandidatePoolSize: 2,
+  };
+}
 
 export interface ViewerDiagnostics {
   fps: number;
@@ -29,10 +53,21 @@ export class WebRTCViewer {
   private peerConnection: RTCPeerConnection | null = null;
   private remoteStream: MediaStream = new MediaStream();
   private broadcasterSocketId: string | null = null;
+  private currentAttemptId: string = '';
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private onTrackCallback?: (stream: MediaStream) => void;
   private onConnectionStateCallback?: (state: RTCPeerConnectionState) => void;
   private onDiagnosticsCallback?: (stats: ViewerDiagnostics) => void;
+
+  // Retry & Watchdog state
+  private isDestroyed: boolean = false;
+  private isConnecting: boolean = false;
+  private retryCount: number = 0;
+  private retryTimeout: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private disconnectGraceTimer: NodeJS.Timeout | null = null;
+
+  // Diagnostics
   private statsInterval: NodeJS.Timeout | null = null;
   private prevBytesReceived = 0;
   private prevTimestamp = 0;
@@ -49,49 +84,108 @@ export class WebRTCViewer {
     this.startDiagnostics();
   }
 
-  public async connect(streamId: string, onTrack?: (stream: MediaStream) => void): Promise<void> {
+  public async connect(streamId: string = 'main-stream', onTrack?: (stream: MediaStream) => void): Promise<void> {
     if (onTrack) this.onTrackCallback = onTrack;
+    this.isDestroyed = false;
 
-    if (
-      this.peerConnection &&
-      (this.peerConnection.connectionState === 'connected' ||
-        this.peerConnection.connectionState === 'connecting')
-    ) {
-      console.log('[WebRTCViewer] Already connected or connecting, skipping redundant join.');
+    if (this.peerConnection && this.peerConnection.connectionState === 'connected') {
+      console.log('[Viewer] WebRTC connection already active.');
       return;
     }
 
-    console.log('[WebRTCViewer] Sending viewer-ready signal...');
-    getSocket().emit('webrtc:viewer-ready', { streamId });
+    this.requestOffer();
+  }
+
+  public requestOffer(): void {
+    if (this.isDestroyed) return;
+
+    this.clearWatchdogTimer();
+    this.clearRetryTimeout();
+
+    this.currentAttemptId = `att_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    this.isConnecting = true;
+
+    console.log(`[Viewer] Requesting offer (attempt #${this.retryCount + 1}, id: ${this.currentAttemptId})`);
+    if (this.onConnectionStateCallback) {
+      this.onConnectionStateCallback('connecting');
+    }
+
+    const socket = getSocket();
+    socket.emit('webrtc:viewer-ready', {
+      streamId: 'main-stream',
+      attemptId: this.currentAttemptId,
+    });
+
+    // Start 12-second connection watchdog timer
+    this.watchdogTimer = setTimeout(() => {
+      if (this.isDestroyed) return;
+      if (!this.peerConnection || this.peerConnection.connectionState !== 'connected') {
+        console.warn('[Viewer] Connection watchdog timed out after 12s without reaching connected state.');
+        this.handleConnectionFailure('Watchdog timeout');
+      }
+    }, 12000);
   }
 
   private setupSocketListeners() {
     const socket = getSocket();
 
+    // Socket reconnection auto-recovery
+    socket.off('connect');
+    socket.on('connect', () => {
+      console.log('[Viewer] Socket connected. Checking stream status...');
+      socket.emit('viewer:join', { streamId: 'main-stream' });
+    });
+
     socket.off('broadcaster:ready');
     socket.on('broadcaster:ready', (data: { streamerSocketId: string }) => {
       this.broadcasterSocketId = data.streamerSocketId;
-      console.log(`[WebRTCViewer] Broadcaster is ready (${data.streamerSocketId}). Signaling readiness...`);
-      socket.emit('webrtc:viewer-ready', { streamId: 'main-stream' });
+      console.log(`[Viewer] Stream state: LIVE. Broadcaster ready (${data.streamerSocketId}).`);
+      if (!this.peerConnection || this.peerConnection.connectionState !== 'connected') {
+        this.requestOffer();
+      }
+    });
+
+    socket.off('stream:status-changed');
+    socket.on('stream:status-changed', (data: { status: string }) => {
+      if (data.status === 'live') {
+        console.log('[Viewer] Stream state: LIVE. Requesting offer...');
+        this.requestOffer();
+      } else if (data.status === 'offline') {
+        console.log('[Viewer] Stream state: OFFLINE. Disconnecting WebRTC...');
+        this.cleanupPeerConnection();
+        if (this.onConnectionStateCallback) {
+          this.onConnectionStateCallback('closed');
+        }
+      }
     });
 
     socket.off('webrtc:offer');
-    socket.on('webrtc:offer', async (data: { offer: RTCSessionDescriptionInit; fromSocketId: string }) => {
+    socket.on('webrtc:offer', async (data: { offer: RTCSessionDescriptionInit; fromSocketId: string; attemptId?: string }) => {
+      if (this.isDestroyed) return;
+
       this.broadcasterSocketId = data.fromSocketId;
-      console.log(`[WebRTCViewer] Received WebRTC offer from broadcaster (${data.fromSocketId})`);
+      if (data.attemptId) {
+        this.currentAttemptId = data.attemptId;
+      }
+
+      console.log(`[Viewer] Offer received from ${data.fromSocketId} (attempt: ${this.currentAttemptId})`);
       await this.handleOffer(data.offer, data.fromSocketId);
     });
 
     socket.off('webrtc:ice-candidate');
-    socket.on('webrtc:ice-candidate', async (data: { candidate: RTCIceCandidateInit; fromSocketId: string }) => {
-      if (this.peerConnection && data.candidate) {
+    socket.on('webrtc:ice-candidate', async (data: { candidate: RTCIceCandidateInit; fromSocketId: string; attemptId?: string }) => {
+      if (this.isDestroyed || !this.peerConnection) return;
+
+      if (data.candidate) {
         if (this.peerConnection.remoteDescription && this.peerConnection.remoteDescription.type) {
           try {
             await this.peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+            console.log('[WebRTC] ICE candidate added');
           } catch (e) {
-            console.error('[WebRTCViewer] ICE candidate error:', e);
+            console.error('[WebRTC] Error adding ICE candidate:', e);
           }
         } else {
+          console.log('[WebRTC] ICE candidate queued');
           this.pendingCandidates.push(data.candidate);
         }
       }
@@ -99,33 +193,40 @@ export class WebRTCViewer {
 
     socket.off('stream:stopped');
     socket.on('stream:stopped', () => {
-      console.log('[WebRTCViewer] Stream stopped by broadcaster.');
-      this.disconnect();
+      console.log('[Viewer] Stream stopped by broadcaster.');
+      this.cleanupPeerConnection();
+      if (this.onConnectionStateCallback) {
+        this.onConnectionStateCallback('closed');
+      }
     });
   }
 
   private async handleOffer(offer: RTCSessionDescriptionInit, broadcasterSocketId: string) {
-    if (this.peerConnection) {
-      this.peerConnection.close();
-      this.peerConnection = null;
-    }
+    this.cleanupPeerConnection();
 
-    this.peerConnection = new RTCPeerConnection(ICE_SERVERS);
-    this.remoteStream = new MediaStream();
+    this.peerConnection = new RTCPeerConnection(getIceServers());
     this.pendingCandidates = [];
 
+    // Track Reception
     this.peerConnection.ontrack = (event) => {
-      console.log(
-        `[WebRTCViewer] Remote track received: [${event.track.kind}] (${event.track.label || 'unnamed'})`
-      );
+      const track = event.track;
+      if (track.kind === 'video') {
+        console.log(`[WebRTC Viewer] Remote video track received (${track.label || 'video'})`);
+      } else if (track.kind === 'audio') {
+        console.log(`[WebRTC Viewer] Remote audio track received (${track.label || 'audio'})`);
+      }
 
-      // Attach stream tracks
+      // Idempotently add track to remoteStream
+      if (!this.remoteStream.getTrackById(track.id)) {
+        this.remoteStream.addTrack(track);
+      }
+
       if (event.streams && event.streams[0]) {
-        this.remoteStream = event.streams[0];
-      } else {
-        if (!this.remoteStream.getTracks().some((t) => t.id === event.track.id)) {
-          this.remoteStream.addTrack(event.track);
-        }
+        event.streams[0].getTracks().forEach((t) => {
+          if (!this.remoteStream.getTrackById(t.id)) {
+            this.remoteStream.addTrack(t);
+          }
+        });
       }
 
       if (this.onTrackCallback) {
@@ -133,40 +234,71 @@ export class WebRTCViewer {
       }
     };
 
+    // ICE Candidate Generation
     this.peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
         getSocket().emit('webrtc:ice-candidate', {
           targetSocketId: broadcasterSocketId,
           candidate: event.candidate,
+          attemptId: this.currentAttemptId,
         });
       }
     };
 
+    // Connection State Change
     this.peerConnection.onconnectionstatechange = () => {
-      const state = this.peerConnection?.connectionState || 'closed';
-      console.log(`[WebRTCViewer] Connection state: ${state}`);
-      if (this.onConnectionStateCallback) {
-        this.onConnectionStateCallback(state);
+      if (!this.peerConnection) return;
+      const state = this.peerConnection.connectionState;
+      console.log(`[Viewer] Connection state: ${state}`);
+
+      if (state === 'connected') {
+        this.isConnecting = false;
+        this.retryCount = 0;
+        this.clearWatchdogTimer();
+        this.clearDisconnectGraceTimer();
+        if (this.onConnectionStateCallback) {
+          this.onConnectionStateCallback('connected');
+        }
+      } else if (state === 'failed') {
+        this.handleConnectionFailure('connectionState failed');
+      } else if (state === 'disconnected') {
+        // Allow a 4s grace window for network jitter before forcing reconnect
+        this.disconnectGraceTimer = setTimeout(() => {
+          if (this.peerConnection?.connectionState === 'disconnected') {
+            console.warn('[Viewer] Connection remained disconnected after 4s grace period.');
+            this.handleConnectionFailure('Disconnected grace expired');
+          }
+        }, 4000);
+      } else if (state === 'closed') {
+        if (this.onConnectionStateCallback) {
+          this.onConnectionStateCallback('closed');
+        }
       }
     };
 
+    // ICE Connection State Change
     this.peerConnection.oniceconnectionstatechange = () => {
-      console.log(`[WebRTCViewer] ICE connection state: ${this.peerConnection?.iceConnectionState}`);
-    };
+      if (!this.peerConnection) return;
+      const iceState = this.peerConnection.iceConnectionState;
+      console.log(`[WebRTC] ICE connection state: ${iceState}`);
 
-    this.peerConnection.onsignalingstatechange = () => {
-      console.log(`[WebRTCViewer] Signaling state: ${this.peerConnection?.signalingState}`);
+      if (iceState === 'connected' || iceState === 'completed') {
+        this.clearDisconnectGraceTimer();
+      } else if (iceState === 'failed') {
+        this.handleConnectionFailure('ICE connection failed');
+      }
     };
 
     try {
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-      console.log('[WebRTCViewer] Remote description set.');
+      console.log('[Viewer] Remote description set');
 
       // Drain queued ICE candidates
       for (const cand of this.pendingCandidates) {
         await this.peerConnection.addIceCandidate(new RTCIceCandidate(cand)).catch((e) =>
-          console.warn('[WebRTCViewer] Error draining ICE candidate:', e)
+          console.warn('[WebRTC] Error draining ICE candidate:', e)
         );
+        console.log('[WebRTC] ICE candidate added from queue');
       }
       this.pendingCandidates = [];
 
@@ -176,12 +308,72 @@ export class WebRTCViewer {
       getSocket().emit('webrtc:answer', {
         targetSocketId: broadcasterSocketId,
         answer: this.peerConnection.localDescription,
+        attemptId: this.currentAttemptId,
       });
 
-      console.log(`[WebRTCViewer] Created and sent answer to broadcaster (${broadcasterSocketId})`);
+      console.log('[Viewer] Answer sent');
     } catch (err) {
-      console.error('[WebRTCViewer] Error handling offer:', err);
+      console.error('[Viewer] Error handling offer:', err);
+      this.handleConnectionFailure('Offer processing error');
     }
+  }
+
+  private handleConnectionFailure(reason: string) {
+    if (this.isDestroyed) return;
+
+    console.warn(`[Viewer] WebRTC connection failed: ${reason}`);
+    this.cleanupPeerConnection();
+
+    // Exponential backoff: 1s, 2s, 4s, 8s, max 10s
+    const delay = Math.min(10000, 1000 * Math.pow(2, this.retryCount));
+    this.retryCount++;
+
+    console.log(`[Viewer] Reconnecting attempt #${this.retryCount} in ${(delay / 1000).toFixed(1)}s...`);
+
+    if (this.onConnectionStateCallback) {
+      this.onConnectionStateCallback('connecting');
+    }
+
+    this.clearRetryTimeout();
+    this.retryTimeout = setTimeout(() => {
+      this.requestOffer();
+    }, delay);
+  }
+
+  private clearWatchdogTimer() {
+    if (this.watchdogTimer) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private clearRetryTimeout() {
+    if (this.retryTimeout) {
+      clearTimeout(this.retryTimeout);
+      this.retryTimeout = null;
+    }
+  }
+
+  private clearDisconnectGraceTimer() {
+    if (this.disconnectGraceTimer) {
+      clearTimeout(this.disconnectGraceTimer);
+      this.disconnectGraceTimer = null;
+    }
+  }
+
+  private cleanupPeerConnection() {
+    this.clearWatchdogTimer();
+    this.clearDisconnectGraceTimer();
+
+    if (this.peerConnection) {
+      this.peerConnection.onconnectionstatechange = null;
+      this.peerConnection.oniceconnectionstatechange = null;
+      this.peerConnection.onicecandidate = null;
+      this.peerConnection.ontrack = null;
+      this.peerConnection.close();
+      this.peerConnection = null;
+    }
+    this.pendingCandidates = [];
   }
 
   private startDiagnostics() {
@@ -269,20 +461,20 @@ export class WebRTCViewer {
   }
 
   public disconnect(): void {
+    this.isDestroyed = true;
+    this.clearWatchdogTimer();
+    this.clearRetryTimeout();
+    this.clearDisconnectGraceTimer();
+
     if (this.statsInterval) {
       clearInterval(this.statsInterval);
       this.statsInterval = null;
     }
 
-    if (this.peerConnection) {
-      this.peerConnection.close();
-      this.peerConnection = null;
-    }
+    this.cleanupPeerConnection();
 
-    this.pendingCandidates = [];
     this.prevBytesReceived = 0;
     this.prevTimestamp = 0;
-
     this.remoteStream.getTracks().forEach((track) => track.stop());
     this.remoteStream = new MediaStream();
   }

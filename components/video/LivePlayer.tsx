@@ -175,9 +175,8 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
 
   const handleManualReconnect = () => {
     if (viewerRef.current) {
-      viewerRef.current.disconnect();
       setConnectionState('connecting');
-      viewerRef.current.connect(streamId);
+      viewerRef.current.requestOffer();
     }
   };
 
