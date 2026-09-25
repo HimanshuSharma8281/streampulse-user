@@ -97,13 +97,18 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         const video = videoRef.current;
         if (!video) return;
 
-        // Idempotently attach remote stream only if different
+        console.log('[LivePlayer] MediaStream updated. Tracks count:', mediaStream.getTracks().length);
+        
+        // Ensure video element receives the stream
         if (video.srcObject !== mediaStream) {
-          console.log('[LivePlayer] Attaching remote MediaStream to video element. Tracks count:', mediaStream.getTracks().length);
           video.srcObject = mediaStream;
-          video.autoplay = true;
-          video.playsInline = true;
+        } else {
+          // Re-bind to ensure browser media engine activates newly attached tracks
+          video.srcObject = mediaStream;
         }
+
+        video.autoplay = true;
+        video.playsInline = true;
 
         if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
           safePlay();
@@ -113,6 +118,16 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
             safePlay();
           };
         }
+
+        video.onloadeddata = () => {
+          console.log(`[LivePlayer] onloadeddata: resolution=${video.videoWidth}x${video.videoHeight}`);
+          safePlay();
+        };
+
+        video.oncanplay = () => {
+          console.log(`[LivePlayer] oncanplay fired`);
+          safePlay();
+        };
 
         video.onplaying = () => {
           console.log(`[LivePlayer] Video element playing event: ${video.videoWidth}x${video.videoHeight}, client: ${video.clientWidth}x${video.clientHeight}`);

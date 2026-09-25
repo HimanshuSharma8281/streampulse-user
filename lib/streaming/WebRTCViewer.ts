@@ -224,7 +224,7 @@ export class WebRTCViewer {
     this.peerConnection = pc;
     this.pendingCandidates = [];
 
-    // Track Reception using stable remoteStream without recreating or stopping existing tracks
+    // Track Reception using fresh active tracks from current peer connection
     pc.ontrack = (event) => {
       if (this.connectionGeneration !== generation || this.isDestroyed) return;
 
@@ -236,18 +236,12 @@ export class WebRTCViewer {
         muted: track.muted,
       });
 
-      // Replace older track of same kind if track ID changed
-      const existing = this.remoteStream
-        .getTracks()
-        .find((t) => t.kind === track.kind);
+      // Unconditionally remove any older track of this kind (including ended tracks)
+      const existingTracks = this.remoteStream.getTracks().filter((t) => t.kind === track.kind);
+      existingTracks.forEach((t) => this.remoteStream.removeTrack(t));
 
-      if (existing && existing.id !== track.id) {
-        this.remoteStream.removeTrack(existing);
-      }
-
-      if (!this.remoteStream.getTracks().some((t) => t.id === track.id)) {
-        this.remoteStream.addTrack(track);
-      }
+      // Add the active incoming track
+      this.remoteStream.addTrack(track);
 
       console.log(
         '[WebRTC] remote stream tracks:',
@@ -260,7 +254,7 @@ export class WebRTCViewer {
       );
 
       track.onunmute = () => {
-        console.log(`[WebRTC Viewer] Track unmuted: [${track.kind}]`);
+        console.log(`[WebRTC Viewer] Track unmuted and receiving frames: [${track.kind}]`);
         if (this.onTrackCallback) {
           this.onTrackCallback(this.remoteStream);
         }
@@ -432,6 +426,11 @@ export class WebRTCViewer {
       this.peerConnection = null;
     }
     this.pendingCandidates = [];
+
+    // Remove old tracks so no ended/dead tracks persist across connection attempts
+    this.remoteStream.getTracks().forEach((track) => {
+      this.remoteStream.removeTrack(track);
+    });
   }
 
   private startDiagnostics() {
