@@ -113,6 +113,10 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
             safePlay();
           };
         }
+
+        video.onplaying = () => {
+          console.log(`[LivePlayer] Video element playing event: ${video.videoWidth}x${video.videoHeight}, client: ${video.clientWidth}x${video.clientHeight}`);
+        };
       },
       (state) => {
         setConnectionState(state);
@@ -140,6 +144,28 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
 
       const stream = video.srcObject as MediaStream | null;
       const vTrack = stream ? stream.getVideoTracks()[0] : null;
+
+      const rect = video.getBoundingClientRect();
+      const parentRect = video.parentElement?.getBoundingClientRect();
+
+      console.log('[VIDEO SIZE]', {
+        clientWidth: video.clientWidth,
+        clientHeight: video.clientHeight,
+        offsetWidth: video.offsetWidth,
+        offsetHeight: video.offsetHeight,
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        boundingRect: {
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          top: Math.round(rect.top),
+          left: Math.round(rect.left),
+        },
+        parentRect: parentRect ? {
+          width: Math.round(parentRect.width),
+          height: Math.round(parentRect.height),
+        } : null,
+      });
 
       console.log(
         `[LivePlayer Diagnostic] <video>: readyState=${video.readyState}, size=${video.videoWidth}x${video.videoHeight}, paused=${video.paused}, time=${video.currentTime.toFixed(1)}s | vTrack: readyState=${vTrack?.readyState}, muted=${vTrack?.muted}, enabled=${vTrack?.enabled}`
@@ -240,7 +266,15 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
     <div
       ref={containerRef}
       onMouseMove={handleMouseMove}
-      className="relative w-full aspect-video bg-[#000000] rounded-2xl overflow-hidden shadow-2xl border border-white/10 group flex items-center justify-center select-none"
+      className="relative w-full aspect-video min-h-[400px] sm:min-h-[500px] bg-[#000000] rounded-2xl overflow-hidden shadow-2xl border border-white/10 group flex items-center justify-center select-none"
+      style={{
+        position: 'relative',
+        width: '100%',
+        height: '100%',
+        minHeight: '400px',
+        overflow: 'hidden',
+        backgroundColor: '#000000',
+      }}
     >
       {/* Persistent HTML5 Video Element */}
       <video
@@ -248,8 +282,18 @@ export const LivePlayer: React.FC<LivePlayerProps> = ({
         autoPlay
         playsInline
         muted={isMuted}
-        className="w-full h-full object-contain"
-        style={{ width: '100%', height: '100%', objectFit: 'contain', backgroundColor: '#000000' }}
+        className="absolute inset-0 w-full h-full object-contain"
+        style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'block',
+          width: '100%',
+          height: '100%',
+          minWidth: '100%',
+          minHeight: '100%',
+          objectFit: 'contain',
+          backgroundColor: '#000000',
+        }}
       />
 
       {/* Autoplay Audio Permission Prompt */}

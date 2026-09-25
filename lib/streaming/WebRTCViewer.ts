@@ -80,6 +80,8 @@ export class WebRTCViewer {
   private watchdogTimer: NodeJS.Timeout | null = null;
   private disconnectGraceTimer: NodeJS.Timeout | null = null;
 
+  private connectionGeneration: number = 0;
+
   // Diagnostics
   private statsInterval: NodeJS.Timeout | null = null;
   private prevBytesReceived = 0;
@@ -215,33 +217,50 @@ export class WebRTCViewer {
   }
 
   private async handleOffer(offer: RTCSessionDescriptionInit, broadcasterSocketId: string) {
+    const generation = ++this.connectionGeneration;
     this.cleanupPeerConnection();
 
-    this.peerConnection = new RTCPeerConnection(getIceServers());
+    const pc = new RTCPeerConnection(getIceServers());
+    this.peerConnection = pc;
     this.pendingCandidates = [];
 
-    // Track Reception
-    this.peerConnection.ontrack = (event) => {
-      const track = event.track;
-      console.log(`[WebRTC Viewer] Track received: [${track.kind}] (${track.label || 'unnamed'}, id: ${track.id}, readyState: ${track.readyState}, muted: ${track.muted})`);
+    // Track Reception using stable remoteStream without recreating or stopping existing tracks
+    pc.ontrack = (event) => {
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
 
-      // 1. Idempotently add track to persistent remoteStream
-      if (!this.remoteStream.getTrackById(track.id)) {
+      const track = event.track;
+      console.log('[WebRTC] ontrack:', {
+        kind: track.kind,
+        id: track.id,
+        readyState: track.readyState,
+        muted: track.muted,
+      });
+
+      // Replace older track of same kind if track ID changed
+      const existing = this.remoteStream
+        .getTracks()
+        .find((t) => t.kind === track.kind);
+
+      if (existing && existing.id !== track.id) {
+        this.remoteStream.removeTrack(existing);
+      }
+
+      if (!this.remoteStream.getTracks().some((t) => t.id === track.id)) {
         this.remoteStream.addTrack(track);
       }
 
-      // 2. Also ensure stream tracks from event.streams[0] are attached
-      if (event.streams && event.streams[0]) {
-        event.streams[0].getTracks().forEach((t) => {
-          if (!this.remoteStream.getTrackById(t.id)) {
-            this.remoteStream.addTrack(t);
-          }
-        });
-      }
+      console.log(
+        '[WebRTC] remote stream tracks:',
+        this.remoteStream.getTracks().map((t) => ({
+          kind: t.kind,
+          id: t.id,
+          readyState: t.readyState,
+          muted: t.muted,
+        }))
+      );
 
-      // 3. Handle unmuting when frames begin flowing
       track.onunmute = () => {
-        console.log(`[WebRTC Viewer] Track unmuted and receiving frames: [${track.kind}]`);
+        console.log(`[WebRTC Viewer] Track unmuted: [${track.kind}]`);
         if (this.onTrackCallback) {
           this.onTrackCallback(this.remoteStream);
         }
@@ -257,7 +276,9 @@ export class WebRTCViewer {
     };
 
     // ICE Candidate Generation & Logging
-    this.peerConnection.onicecandidate = (event) => {
+    pc.onicecandidate = (event) => {
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
+
       if (event.candidate) {
         const candidateStr = event.candidate.candidate || '';
         const candType = event.candidate.type || (candidateStr.includes('typ relay') ? 'relay' : candidateStr.includes('typ srflx') ? 'srflx' : 'host');
@@ -274,14 +295,14 @@ export class WebRTCViewer {
       }
     };
 
-    this.peerConnection.onicegatheringstatechange = () => {
-      console.log(`[WebRTC Viewer] ICE gathering state: ${this.peerConnection?.iceGatheringState}`);
+    pc.onicegatheringstatechange = () => {
+      console.log(`[WebRTC Viewer] ICE gathering state: ${pc.iceGatheringState}`);
     };
 
     // Connection State Change
-    this.peerConnection.onconnectionstatechange = () => {
-      if (!this.peerConnection) return;
-      const state = this.peerConnection.connectionState;
+    pc.onconnectionstatechange = () => {
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
+      const state = pc.connectionState;
       console.log(`[Viewer] Connection state: ${state}`);
 
       if (state === 'connected') {
@@ -297,7 +318,7 @@ export class WebRTCViewer {
       } else if (state === 'disconnected') {
         // Allow a 4s grace window for network jitter before forcing reconnect
         this.disconnectGraceTimer = setTimeout(() => {
-          if (this.peerConnection?.connectionState === 'disconnected') {
+          if (this.connectionGeneration === generation && pc.connectionState === 'disconnected') {
             console.warn('[Viewer] Connection remained disconnected after 4s grace period.');
             this.handleConnectionFailure('Disconnected grace expired');
           }
@@ -310,9 +331,9 @@ export class WebRTCViewer {
     };
 
     // ICE Connection State Change
-    this.peerConnection.oniceconnectionstatechange = () => {
-      if (!this.peerConnection) return;
-      const iceState = this.peerConnection.iceConnectionState;
+    pc.oniceconnectionstatechange = () => {
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
+      const iceState = pc.iceConnectionState;
       console.log(`[WebRTC Viewer] ICE connection state: ${iceState}`);
 
       if (iceState === 'connected' || iceState === 'completed') {
@@ -323,29 +344,32 @@ export class WebRTCViewer {
     };
 
     try {
-      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
       console.log('[Viewer] Remote description set');
 
       // Drain queued ICE candidates
       for (const cand of this.pendingCandidates) {
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(cand)).catch((e) =>
+        await pc.addIceCandidate(new RTCIceCandidate(cand)).catch((e) =>
           console.warn('[WebRTC Viewer] Error draining ICE candidate:', e)
         );
         console.log('[WebRTC Viewer] ICE candidate added from queue');
       }
       this.pendingCandidates = [];
 
-      const answer = await this.peerConnection.createAnswer();
-      await this.peerConnection.setLocalDescription(answer);
+      const answer = await pc.createAnswer();
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
+      await pc.setLocalDescription(answer);
 
       getSocket().emit('webrtc:answer', {
         targetSocketId: broadcasterSocketId,
-        answer: this.peerConnection.localDescription,
+        answer: pc.localDescription,
         attemptId: this.currentAttemptId,
       });
 
       console.log('[Viewer] Answer sent');
     } catch (err) {
+      if (this.connectionGeneration !== generation || this.isDestroyed) return;
       console.error('[Viewer] Error handling offer:', err);
       this.handleConnectionFailure('Offer processing error');
     }
@@ -539,6 +563,7 @@ export class WebRTCViewer {
 
   public disconnect(): void {
     this.isDestroyed = true;
+    this.connectionGeneration++;
     this.clearWatchdogTimer();
     this.clearRetryTimeout();
     this.clearDisconnectGraceTimer();
@@ -552,7 +577,9 @@ export class WebRTCViewer {
 
     this.prevBytesReceived = 0;
     this.prevTimestamp = 0;
-    this.remoteStream.getTracks().forEach((track) => track.stop());
-    this.remoteStream = new MediaStream();
+    // Remove tracks from the stream without calling .stop() on remote browser tracks
+    this.remoteStream.getTracks().forEach((track) => {
+      this.remoteStream.removeTrack(track);
+    });
   }
 }
